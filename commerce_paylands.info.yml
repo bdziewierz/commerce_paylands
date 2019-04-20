@@ -1,0 +1,8 @@
+name: Commerce Paylands
+type: module
+description: 'Provides Paylands gateway.'
+package: Commerce
+# core: 8.x
+dependencies:
+  - commerce:commerce
+  - commerce:commerce_payment
