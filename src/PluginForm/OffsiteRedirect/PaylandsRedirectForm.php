@@ -40,21 +40,31 @@ class PaylandsRedirectForm extends BasePaymentOffsiteForm {
     }
 
     // Determine correct endpoint
-    $Paylands_endpoint = $payment_gateway_plugin->getPaymentAPIEndpoint();
+    $paylands_endpoint = $payment_gateway_plugin->getPaymentAPIEndpoint();
 
-    // Format amount
-    $amount = $order->getTotalPrice()->getCurrencyCode() == 'IDR'
-      ? floor($order->getTotalPrice()->getNumber())  // Indonesian Rupiah should be sent without digits behind comma
-      : sprintf('%0.2f', $order->getTotalPrice()->getNumber());
+    // Format amount (in cents)
+    $amount = doubleval($order->getTotalPrice()->getNumber()) * 100;
 
     // Prepare the first phase request array
-    $request = array(
-      // TODO
+    $request = array (
+      'operative' => 'AUTHORIZATION',
+      'service' => $config['service'],
+      'signature' => $config['signature'],
+      'amount' => $amount,
+      'customer_ext_id' => $order->id(),
+      'additional' => $order->getEmail(),
+      'description' => $billing_address->getGivenName() . ' ' . $billing_address->getFamilyName() . ' (' . $order->id() . ')',
+      'secure' => true,
+      'url_post' => $payment_gateway_plugin->getNotifyUrl()->toString(),
+      'url_ok' => $form['#return_url'],
+      'url_ko' => $form['#return_url'],
+      'template_uuid' => '6a93c26e-954d-47ea-83bf-21fa29b68f28',
     );
 
-    // Call a service
+    // Call a staging service
     $http = \Drupal::httpClient()
-      ->post($Paylands_endpoint, [
+      ->post($paylands_endpoint . '/payment', [
+        'auth' => [$config['api_key']],
         'body' => json_encode($request),
         'http_errors' => FALSE,
         'headers' => [
@@ -65,22 +75,23 @@ class PaylandsRedirectForm extends BasePaymentOffsiteForm {
     $response = json_decode($body, TRUE);
 
     // Validate response code
-    if (!isset($response['response_code'])) {
+    if (!isset($response['code'])) {
       throw new InvalidResponseException('No response code.');
     }
-    if ($response['response_code'] != 0) {
-      throw new InvalidResponseException('Invalid request: ' . $response['response_msg']);
+    if ($response['code'] != 200) {
+      throw new InvalidResponseException('Invalid request: ' . $response['message']);
     }
 
     // Validate payment URL
-    if (empty($response['payment_url'])) {
-      throw new InvalidResponseException('Invalid response, no payment_url');
+    if (empty($response['order']['token'])) {
+      throw new InvalidResponseException('Invalid response, no token');
     }
 
-    // Associated payment with the transaction.
-    $payment->setRemoteId($response['transaction_id']);
+    // Associated payment with the order uuid.
+    $payment->setRemoteId($response['order']['uuid']);
     $payment->save();
 
-    return $this->buildRedirectForm($form, $form_state, $response['payment_url'], array());
+    $redirect_url = $paylands_endpoint . '/payment/process/' . $response['order']['token'];
+    return $this->buildRedirectForm($form, $form_state, $redirect_url, array('lang' => $current_language->getId()));
   }
 }

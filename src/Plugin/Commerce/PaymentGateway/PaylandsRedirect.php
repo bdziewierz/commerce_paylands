@@ -35,6 +35,7 @@ class PaylandsRedirect extends OffsitePaymentGatewayBase {
     return [
       'api_key' => '',
       'signature' => '',
+      'service' => '',
     ] + parent::defaultConfiguration();
   }
 
@@ -47,7 +48,7 @@ class PaylandsRedirect extends OffsitePaymentGatewayBase {
     $form['api_key'] = [
       '#type' => 'textfield',
       '#required' => TRUE,
-      '#title' => $this->t('Merchant ID'),
+      '#title' => $this->t('API Key'),
       '#description' => $this->t('Paylands Merchant ID given to you when registering for Paylands account.'),
       '#default_value' => $this->configuration['api_key'],
     ];
@@ -80,6 +81,7 @@ class PaylandsRedirect extends OffsitePaymentGatewayBase {
       $values = $form_state->getValue($form['#parents']);
       $this->configuration['api_key'] = $values['api_key'];
       $this->configuration['signature'] = $values['signature'];
+      $this->configuration['service'] = $values['service'];
     }
   }
 
@@ -92,9 +94,71 @@ class PaylandsRedirect extends OffsitePaymentGatewayBase {
     $config = $this->getConfiguration();
     $paylands_endpoint = 'https://api.paylands.com/v1';
     if ($config['mode'] == 'test') {
-      $paylands_endpoint = ' https://api.paylands.com/v1/sandbox';
+      $paylands_endpoint = 'https://api.paylands.com/v1/sandbox';
     }
     return $paylands_endpoint;
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  public function onNotify(Request $request) {
+    parent::onNotify($request);
+
+    // Get notification response
+    $response = json_decode($request->getContent(), true);
+    if (empty($response)) {
+      throw new InvalidResponseException('No response returned.');
+    }
+
+    $this->handleTransaction($response);
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  public function onReturn(OrderInterface $order, Request $request) {
+    parent::onReturn($order, $request);
+
+    $paylands_endpoint = $this->getPaymentAPIEndpoint();
+
+    // Get Drupal's payment object
+    $payments = \Drupal::entityTypeManager()->getStorage('commerce_payment')->loadMultipleByOrder($order);
+    if (empty($payments)) {
+      throw new InvalidResponseException('No payments for given order.');
+    }
+
+    // Validate last payment object. If it's completed (validated in Notify),
+    // then we're good. Otherwise, check the status with API.
+
+    /** @var \Drupal\commerce_payment\Entity\PaymentInterface $payment */
+    $payment = end($payments);
+    if (!$payment->isCompleted()) {
+
+      $order_uuid = $payment->getRemoteId();
+      if (empty($order_uuid)) {
+        throw new InvalidResponseException('No order_uuid for given payment.');
+      }
+
+      /** @var \Drupal\commerce_paylands\Plugin\Commerce\PaymentGateway\PaylandsRedirect $payment_gateway_plugin */
+      $payment_gateway_plugin = $payment->getPaymentGateway()->getPlugin();
+      $config = $payment_gateway_plugin->getConfiguration();
+      $http = \Drupal::httpClient()
+        ->get($paylands_endpoint . '/order/' . $order_uuid, [
+          'auth' => [$config['api_key']],
+          'http_errors' => FALSE,
+          'headers' => [
+            'Content-Type' => 'application/json',
+          ],
+        ]);
+      $body = $http->getBody()->getContents();
+      $response = json_decode($body, TRUE);
+      if (empty($response)) {
+        throw new InvalidResponseException('No response returned.');
+      }
+
+      $this->handleTransaction($response);
+    }
   }
 
   /**
@@ -105,58 +169,33 @@ class PaylandsRedirect extends OffsitePaymentGatewayBase {
   }
 
   /**
-   * {@inheritdoc}
-   */
-  public function onNotify(Request $request) {
-    parent::onNotify($request);
-
-    // Get response
-    $transaction_response = json_decode($request->getContent(), true);
-    if (empty($transaction_response)) {
-      throw new InvalidResponseException('No response returned.');
-    }
-
-    $this->handleTransaction($transaction_response);
-  }
-
-  /**
-   * {@inheritdoc}
-   */
-  public function onReturn(OrderInterface $order, Request $request) {
-    parent::onReturn($order, $request);
-
-    // Get response
-    $transaction_response = json_decode($request->getContent(), true);
-    if (empty($transaction_response)) {
-      throw new InvalidResponseException('No response returned.');
-    }
-
-    $this->handleTransaction($transaction_response);
-  }
-
-  /**
-   * Helper function to hanlde the transaction for both onNotify and onReturn.
+   * Helper function to handle the transaction for both onNotify and onReturn.
    *
    * @param $config
    * @param $order
    * @param $response
    */
   private function handleTransaction($response) {
-    // Validate order_id
-    if (empty($response['order_id'])) {
+    // Validate if customer id is returned. We store Drupal's order ID in this field.
+    // This way it will work for both anonymous and authenticated purchases.
+    if (empty($response['order']['customer'])) {
       throw new InvalidResponseException('Order ID not provided in response.');
     }
-    $order = \Drupal::entityTypeManager()->getStorage('commerce_order')->load($response['order_id']);
+    
+    $order = \Drupal::entityTypeManager()->getStorage('commerce_order')->load($response['order']['customer']);
     if (empty($order)) {
-      throw new PaymentGatewayException('Order ID returned from the service not found.');
+      throw new PaymentGatewayException('Order ID returned from the service not found in Drupal.');
     }
 
-    // Check if we have a payment matching the transaction ID
+    // Get Drupal's payment object
     $payments = \Drupal::entityTypeManager()->getStorage('commerce_payment')->loadMultipleByOrder($order);
+    if (empty($payments)) {
+      throw new InvalidResponseException('No payments for given order.');
+    }
     $payment = NULL;
     /** @var \Drupal\commerce_payment\Entity\PaymentInterface $payment */
     foreach($payments as $order_payment) {
-      if ($order_payment->getRemoteId() == $response['transaction_id']) {
+      if ($order_payment->getRemoteId() == $response['order']['uuid']) {
         $payment = $order_payment;
         break;
       }
@@ -165,14 +204,19 @@ class PaylandsRedirect extends OffsitePaymentGatewayBase {
       throw new InvalidResponseException('No payments matching returned transaction ID.');
     }
 
-    // Validate response code
-    if (!isset($response['response_code'])) {
-      throw new InvalidResponseException('No response code.');
+    // Get Payland's transaction
+    if (empty($response['order']['transactions'])) {
+      throw new InvalidResponseException('No transactions information.');
     }
-    if ($response['response_code'] != 0) {
-      throw new DeclineException($this->t('Payment has been declined by the gateway (@error_code).', [
-        '@error_code' => $response['response_code'],
-      ]), $response['response_code']);
+    $transaction = array_pop($response['order']['transactions']);
+
+    if (!isset($transaction['status'])) {
+      throw new InvalidResponseException('No transaction status information.');
+    }
+    if ($transaction['status'] != 'SUCCESS') {
+      throw new DeclineException($this->t('Payment has been declined by the gateway (@error).', [
+        '@error' => $transaction['error'],
+      ]), $transaction['error']);
     }
 
     // Set payment as completed
@@ -180,7 +224,5 @@ class PaylandsRedirect extends OffsitePaymentGatewayBase {
     $payment->setCompletedTime(REQUEST_TIME);
     $payment->setState('completed');
     $payment->save();
-
-    // TODO: Handle authorisations as well, currently only Sale allowed.
   }
 }
